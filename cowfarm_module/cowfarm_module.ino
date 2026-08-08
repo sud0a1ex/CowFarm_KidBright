@@ -1,6 +1,17 @@
 #include <Wire.h>
 #include <Adafruit_MLX90614.h>
 #include "DHT.h"
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
+
+// Wi-Fi Access Point Credentials
+const char* ssid = "CowFarm_Robot";
+const char* password = "smt1029384756";
+
+// Web Server & WebSocket setup
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
 
 // Hardware Pin & Address Definitions
 #define MCP_ADDR    0x20
@@ -20,14 +31,92 @@ DHT dht(DHTPIN, DHTTYPE);
 bool isRobotOn = false;          // Toggle state for robot movement
 bool lastButtonState = HIGH;     // Button state tracking
 unsigned long lastSensorRead = 0;// Telemetry update timer
-unsigned long lastDHTRead = 0;   // DHT22 timer (2s required interval)
+unsigned long lastDHTRead = 0;   // DHT22 timer
+unsigned long lastSonarRead = 0; // Sonar timer while driving
 
 // Cached sensor & calibration values
 float r0 = 76.63;
 float dhtTemp = 0.0;
 float dhtHumidity = 0.0;
 float sonarDistanceCM = -1.0;
-float ammoniaPPM = 0.0;         // Global cache for ammonia level
+float ammoniaPPM = 0.0;
+float objectC = 0.0;
+
+// Embedded HTML/JS Dashboard
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Robot Telemetry Dashboard</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #121212; color: #fff; text-align: center; margin:0; padding:20px; }
+    h1 { color: #00E676; margin-bottom: 20px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; max-width: 800px; margin: auto; }
+    .card { background: #1E1E1E; padding: 20px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.5); }
+    .val { font-size: 1.8em; font-weight: bold; margin-top: 10px; color: #4FC3F7; }
+    .status-on { color: #00E676; font-weight: bold; }
+    .status-off { color: #FF5252; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>KidBright Robot Dashboard</h1>
+  <div class="grid">
+    <div class="card"><div>Robot State</div><div id="robot" class="val status-off">STOPPED</div></div>
+    <div class="card"><div>Distance</div><div id="sonar" class="val">-- cm</div></div>
+    <div class="card"><div>Ammonia (NH3)</div><div id="nh3" class="val">-- PPM</div></div>
+    <div class="card"><div>Mini Pump</div><div id="pump" class="val status-off">OFF</div></div>
+    <div class="card"><div>IR Temp</div><div id="irtemp" class="val">-- &deg;C</div></div>
+    <div class="card"><div>Air Temp</div><div id="airtemp" class="val">-- &deg;C</div></div>
+    <div class="card"><div>Humidity</div><div id="humidity" class="val">-- %</div></div>
+  </div>
+
+  <script>
+    var gateway = `ws://${window.location.hostname}/ws`;
+    var websocket;
+
+    function initWebSocket() {
+      websocket = new WebSocket(gateway);
+      websocket.onmessage = onMessage;
+      websocket.onclose = function() { setTimeout(initWebSocket, 2000); };
+    }
+
+    function onMessage(event) {
+      var data = JSON.parse(event.data);
+      document.getElementById('sonar').innerHTML = data.sonar > 0 ? data.sonar.toFixed(1) + " cm" : "Out of Range";
+      document.getElementById('nh3').innerHTML = data.nh3.toFixed(1) + " PPM";
+      document.getElementById('irtemp').innerHTML = data.irTemp.toFixed(1) + " &deg;C";
+      document.getElementById('airtemp').innerHTML = data.airTemp.toFixed(1) + " &deg;C";
+      document.getElementById('humidity').innerHTML = data.humidity.toFixed(1) + " %";
+      
+      var pumpEl = document.getElementById('pump');
+      pumpEl.innerHTML = data.pump ? "ON" : "OFF";
+      pumpEl.className = data.pump ? "val status-on" : "val status-off";
+
+      var robotEl = document.getElementById('robot');
+      robotEl.innerHTML = data.robot ? "RUNNING" : "STOPPED";
+      robotEl.className = data.robot ? "val status-on" : "val status-off";
+    }
+
+    window.addEventListener('load', initWebSocket);
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// Broadcasts JSON sensor data to all connected web clients
+void notifyClients() {
+  String json = "{";
+  json += "\"sonar\":" + String(sonarDistanceCM) + ",";
+  json += "\"nh3\":" + String(ammoniaPPM) + ",";
+  json += "\"irTemp\":" + String(objectC) + ",";
+  json += "\"airTemp\":" + String(dhtTemp) + ",";
+  json += "\"humidity\":" + String(dhtHumidity) + ",";
+  json += "\"pump\":" + String(digitalRead(PUMP_OUT1) == LOW ? "true" : "false") + ",";
+  json += "\"robot\":" + String(isRobotOn ? "true" : "false");
+  json += "}";
+  ws.textAll(json);
+}
 
 // Measures sonar distance in centimeters
 float getSonarDistanceCM() {
@@ -37,15 +126,11 @@ float getSonarDistanceCM() {
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
 
-  // Read echo pulse with a 30ms timeout (~500 cm max range)
   long duration = pulseIn(ECHO_PIN, HIGH, 30000); 
-  if (duration == 0) return -1.0; // Out of range / timeout
-
-  // Speed of sound = 0.0343 cm/us (divided by 2 for round-trip)
+  if (duration == 0) return -1.0;
   return (duration * 0.0343) / 2.0;
 }
 
-// Auto-zeros MQ135 baseline over 3 seconds (~1.0 PPM default)
 void autoZeroMQ135() {
   Serial.println("Auto-zeroing MQ135... Keep ambient air steady for 3s.");
   float totalRs = 0;
@@ -64,16 +149,10 @@ void autoZeroMQ135() {
   float avgRs = totalRs / samples;
   float targetRatio = pow(1.0 / 102.2, -1.0 / 2.473);
   r0 = avgRs / targetRatio;
-
-  Serial.print("Auto-zero complete! Dynamic R0: ");
-  Serial.print(r0);
-  Serial.println(" kOhm");
 }
 
-// Calculates Ammonia (NH3) PPM
 float getMQ135PPM(int rawValue) {
   if (rawValue <= 0) return 0.0;
-
   float vOut = (rawValue / 4095.0) * 3.3;
   if (vOut <= 0.05) return 0.0;
   if (vOut >= 3.3)  vOut = 3.29;
@@ -86,12 +165,8 @@ float getMQ135PPM(int rawValue) {
 void setup() {
   Serial.begin(115200);
   Wire.begin(21, 22);
-
   dht.begin();
-
-  if (!mlx.begin()) {
-    Serial.println("WARNING: MLX90614 not found!");
-  }
+  mlx.begin();
 
   // Pin configurations
   pinMode(BUTTON_S1, INPUT_PULLUP);
@@ -100,9 +175,9 @@ void setup() {
   pinMode(ECHO_PIN, INPUT);
   
   pinMode(PUMP_OUT1, OUTPUT);
-  digitalWrite(PUMP_OUT1, HIGH); // Ensure pump starts OFF (Active-LOW)
+  digitalWrite(PUMP_OUT1, HIGH); // Pump starts OFF (Active-LOW)
 
-  // Set Port A on MCP23017 to outputs
+  // Configure MCP23017 outputs
   Wire.beginTransmission(MCP_ADDR);
   Wire.write(0x00);
   Wire.write(0x00);
@@ -110,59 +185,88 @@ void setup() {
 
   stopRobot();
   autoZeroMQ135();
+
+  // Start Wi-Fi Access Point
+  WiFi.softAP(ssid, password);
+  Serial.print("Wi-Fi AP Started. Dashboard IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Serve static HTML dashboard & attach WebSocket handler
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", index_html);
+  });
+  server.addHandler(&ws);
+  server.begin();
 }
 
 void loop() {
+  ws.cleanupClients();
   checkButton();
-  readSensorsNonBlocking();
 
   if (isRobotOn) {
-    // 1. Walk forward
     moveForward();
+    readSonarOnly();
 
-    // 2. Detect object closer than 25cm
     if (sonarDistanceCM > 0.0 && sonarDistanceCM < 25.0) {
       stopRobot();
-      Serial.println("Obstacle detected (< 25cm)! Stopped.");
+      Serial.println("Obstacle detected (< 25cm)! Stopped motors.");
 
-      // 3. Wait 3 seconds while keeping sensors and button responsive
       unsigned long stopStartTime = millis();
       while (millis() - stopStartTime < 3000) {
+        ws.cleanupClients();
         checkButton();
-        readSensorsNonBlocking();
+        readAllSensorsNonBlocking();
         if (!isRobotOn) {
           stopRobot();
-          digitalWrite(PUMP_OUT1, HIGH); // Turn off pump if robot toggled off
+          digitalWrite(PUMP_OUT1, HIGH);
           return;
         }
         delay(50);
       }
 
-      // Check Ammonia PPM after 3-second wait
       if (ammoniaPPM > NH3_THRESHOLD_PPM) {
         Serial.println("Ammonia > 25 PPM! Activating pump...");
-        digitalWrite(PUMP_OUT1, LOW); // Activate pump (Active-LOW)
+        digitalWrite(PUMP_OUT1, LOW); // Active-LOW
 
-        // Keep pumping until PPM drops below threshold
         while (isRobotOn && (ammoniaPPM > NH3_THRESHOLD_PPM)) {
+          ws.cleanupClients();
           checkButton();
-          readSensorsNonBlocking();
+          readAllSensorsNonBlocking();
           delay(100);
         }
 
         digitalWrite(PUMP_OUT1, HIGH); // Deactivate pump
-        Serial.println("Ammonia level clear (< 25 PPM). Pump deactivated.");
+        Serial.println("Ammonia level clear (< 25 PPM). Pump stopped.");
+
+        unsigned long postPumpTime = millis();
+        while (millis() - postPumpTime < 2000) {
+          ws.cleanupClients();
+          checkButton();
+          readAllSensorsNonBlocking();
+          if (!isRobotOn) {
+            stopRobot();
+            digitalWrite(PUMP_OUT1, HIGH);
+            return;
+          }
+          delay(50);
+        }
       }
     }
   } else {
     stopRobot();
-    digitalWrite(PUMP_OUT1, HIGH); // Ensure pump stays OFF when robot is stopped
+    digitalWrite(PUMP_OUT1, HIGH);
   }
 }
 
-// Updates telemetry non-blockingly
-void readSensorsNonBlocking() {
-  // DHT22 sampling (minimum 2000ms interval)
+void readSonarOnly() {
+  if (millis() - lastSonarRead >= 100) {
+    lastSonarRead = millis();
+    sonarDistanceCM = getSonarDistanceCM();
+    notifyClients();
+  }
+}
+
+void readAllSensorsNonBlocking() {
   if (millis() - lastDHTRead >= 2000) {
     lastDHTRead = millis();
     float h = dht.readHumidity();
@@ -173,32 +277,12 @@ void readSensorsNonBlocking() {
     }
   }
 
-  // General Telemetry (500ms interval)
   if (millis() - lastSensorRead >= 500) {
     lastSensorRead = millis();
-
-    float objectC = mlx.readObjectTempC();
+    objectC = mlx.readObjectTempC();
     ammoniaPPM = getMQ135PPM(analogRead(MQ135_PIN));
     sonarDistanceCM = getSonarDistanceCM();
-
-    // Serial Stream Output
-    Serial.print("Distance: ");
-    if (sonarDistanceCM > 0) {
-      Serial.print(sonarDistanceCM, 1);
-      Serial.print(" cm");
-    } else {
-      Serial.print("Out of Range");
-    }
-    Serial.print(" | IR Temp: ");
-    Serial.print(objectC);
-    Serial.print(" °C | Air Temp: ");
-    Serial.print(dhtTemp);
-    Serial.print(" °C | Humidity: ");
-    Serial.print(dhtHumidity);
-    Serial.print(" % | NH3: ");
-    Serial.print(ammoniaPPM, 1);
-    Serial.print(" PPM | Pump: ");
-    Serial.println(digitalRead(PUMP_OUT1) == LOW ? "ON" : "OFF");
+    notifyClients();
   }
 }
 
@@ -206,7 +290,8 @@ void checkButton() {
   bool currentButtonState = digitalRead(BUTTON_S1);
   if (lastButtonState == HIGH && currentButtonState == LOW) {
     isRobotOn = !isRobotOn;
-    delay(200); // Debounce
+    notifyClients();
+    delay(200);
   }
   lastButtonState = currentButtonState;
 }
